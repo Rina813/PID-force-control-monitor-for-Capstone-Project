@@ -1,0 +1,294 @@
+// ================= CALIBRATION PARAMETERS ====================
+float Vref = 5.019;
+const float ADCmax = 1023.0;
+const float forceSlope = 104.2;   // lbs per Volt (from LBO-500 cal)
+float tareVoltageOffset = 0.0;
+unsigned long trialStartTime = 0;
+
+// ================= PID & ACTUATOR SETTINGS ===================
+double Kp = 10.0, Ki = 0.0, Kd = 0.0;
+double targetForce = 100.0;
+double maxForceLimit = 150.0;   // Safety cutoff threshold
+
+const int PWM_SPEED = 255;
+const int RETRACT_SPEED = 255;
+unsigned long RETRACT_TIME = 12000;   // Default 8 seconds — change with retract:<ms>
+
+// ================= HARDWARE PINS (CYTRON MD10) ===============
+const int PWM_PIN = 9;
+const int DIR_PIN = 8;
+const int loadCellPin = A0;
+
+// ================= SYSTEM VARIABLES ==========================
+double currentForce = 0;
+double error = 0, lastError = 0, cumError = 0, rateError = 0;
+
+// System States: 0 = IDLE, 1 = PID_RUNNING, 2 = RETRACTING
+int systemState = 0;
+unsigned long retractStartTime = 0;
+
+// ================= STEP RESPONSE TUNING VARIABLES ============
+bool stepTestMode = false;
+double stepOpenLoopPWM = 100.0;  // Fixed PWM output for step test
+
+void setup() {
+  pinMode(PWM_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
+  stopMotor();
+
+  Serial.begin(115200);
+  delay(1000);
+
+  calibrateTare();
+
+  Serial.println("\n--- ARDUINO READY (CYTRON SHIELD) ---");
+  printHelp();
+}
+
+void loop() {
+  checkSerial();
+
+  // Read sensor with oversampling
+  float rawSum = 0;
+  for (int i = 0; i < 100; i++) {
+    rawSum += analogRead(loadCellPin);
+  }
+  float rawAvg = rawSum / 100.0;
+
+  float currentVoltage = (rawAvg / ADCmax) * Vref;
+  float actualVoltage  = currentVoltage - tareVoltageOffset;
+  currentForce = actualVoltage * forceSlope;
+
+  // Hard safety check
+  if (currentForce > maxForceLimit) {
+    emergencyStop("FORCE LIMIT EXCEEDED!");
+  }
+
+  // ================= STATE MACHINE =================
+  if (systemState == 1) {
+    // --- STATE 1: PID RUNNING ---
+    double pidOutput = computePID(currentForce);
+    driveActuator(pidOutput);
+
+    unsigned long currentTime = millis() - trialStartTime;
+    Serial.print("DATA,");
+    Serial.print(currentTime);       Serial.print(",");
+    Serial.print(rawAvg, 1);         Serial.print(",");
+    Serial.print(actualVoltage, 4);  Serial.print(",");
+    Serial.print(currentForce, 2);   Serial.print(",");
+    Serial.print(targetForce, 2);    Serial.print(",");
+    Serial.print(Kp, 4);             Serial.print(",");
+    Serial.print(Ki, 4);             Serial.print(",");
+    Serial.println(Kd, 4);
+
+  } else if (systemState == 2) {
+    // --- STATE 2: RETRACTING ---
+    if (millis() - retractStartTime < RETRACT_TIME) {
+      digitalWrite(DIR_PIN, HIGH);
+      analogWrite(PWM_PIN, RETRACT_SPEED);
+    } else {
+      stopMotor();
+      systemState = 0;
+      Serial.println("STATUS,RETRACT_COMPLETE");
+    }
+
+  } else if (systemState == 3) {
+    // --- STATE 3: OPEN-LOOP STEP TEST (for Ziegler-Nichols) ---
+    digitalWrite(DIR_PIN, LOW);
+    analogWrite(PWM_PIN, (int)stepOpenLoopPWM);
+
+    unsigned long currentTime = millis() - trialStartTime;
+    Serial.print("DATA,");
+    Serial.print(currentTime);     Serial.print(",");
+    Serial.print(rawAvg, 1);       Serial.print(",");
+    Serial.print(actualVoltage, 4); Serial.print(",");
+    Serial.print(currentForce, 2); Serial.print(",");
+    Serial.print(targetForce, 2);  Serial.print(",");
+    Serial.print(Kp, 4);           Serial.print(",");
+    Serial.print(Ki, 4);           Serial.print(",");
+    Serial.println(Kd, 4);
+
+  } else {
+    // --- STATE 0: IDLE ---
+    stopMotor();
+  }
+}
+
+// ================= SERIAL COMMAND PARSER =================
+// Commands (send via Serial Monitor or Python script):
+//   go           → Start PID trial
+//   s            → Stop trial, begin retract
+//   tare         → Re-zero the load cell
+//   params       → Print current PID & target values
+//   help         → Print command list
+//   step:<pwm>   → Open-loop step test at fixed PWM (e.g. step:80)
+//   kp:<value>   → Set proportional gain   (e.g. kp:12.5)
+//   ki:<value>   → Set integral gain       (e.g. ki:0.1)
+//   kd:<value>   → Set derivative gain     (e.g. kd:0.05)
+//   target:<lbs> → Set force setpoint      (e.g. target:60)
+//   limit:<lbs>  → Set safety force limit  (e.g. limit:120)
+
+void checkSerial() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    input.toLowerCase();
+
+    // ---- Simple Commands ----
+    if (input == "go" && systemState == 0) {
+      cumError = 0;
+      lastError = 0;
+      trialStartTime = millis();
+      systemState = 1;
+      // CSV header for Python to detect start of data
+      Serial.println("HEADER,Time(ms),RawADC,Voltage(V),Force(lbs),Target(lbs),Kp,Ki,Kd");
+
+    } else if (input == "s" && (systemState == 1 || systemState == 3)) {
+      systemState = 2;
+      retractStartTime = millis();
+      Serial.println("STATUS,STOPPING_RETRACTING");
+
+    } else if (input == "tare") {
+      calibrateTare();
+
+    } else if (input == "params") {
+      printParams();
+
+    } else if (input == "help") {
+      printHelp();
+
+    // ---- Parameterized Commands ----
+    } else if (input.startsWith("kp:")) {
+      Kp = input.substring(3).toFloat();
+      Serial.print("SET,Kp="); Serial.println(Kp, 4);
+
+    } else if (input.startsWith("ki:")) {
+      Ki = input.substring(3).toFloat();
+      Serial.print("SET,Ki="); Serial.println(Ki, 4);
+
+    } else if (input.startsWith("kd:")) {
+      Kd = input.substring(3).toFloat();
+      Serial.print("SET,Kd="); Serial.println(Kd, 4);
+
+    } else if (input.startsWith("target:")) {
+      double newTarget = input.substring(7).toFloat();
+      if (newTarget > 0 && newTarget < maxForceLimit) {
+        targetForce = newTarget;
+        Serial.print("SET,Target="); Serial.println(targetForce, 2);
+      } else {
+        Serial.println("ERROR,Target out of safe range.");
+      }
+
+    } else if (input.startsWith("limit:")) {
+      double newLimit = input.substring(6).toFloat();
+      if (newLimit > 0 && newLimit <= 500) {
+        maxForceLimit = newLimit;
+        Serial.print("SET,Limit="); Serial.println(maxForceLimit, 2);
+      } else {
+        Serial.println("ERROR,Limit value rejected.");
+      }
+
+    } else if (input.startsWith("retract:")) {
+      unsigned long newRetract = (unsigned long)input.substring(8).toFloat();
+      if (newRetract >= 500 && newRetract <= 30000) {
+        RETRACT_TIME = newRetract;
+        Serial.print("SET,RetractTime="); Serial.print(RETRACT_TIME); Serial.println("ms");
+      } else {
+        Serial.println("ERROR,RetractTime must be 500-30000 ms.");
+      }
+
+    } else if (input.startsWith("step:") && systemState == 0) {
+      double pwmVal = input.substring(5).toFloat();
+      if (pwmVal > 0 && pwmVal <= 255) {
+        stepOpenLoopPWM = pwmVal;
+        cumError = 0;
+        lastError = 0;
+        trialStartTime = millis();
+        systemState = 3;
+        Serial.println("HEADER,Time(ms),RawADC,Voltage(V),Force(lbs),Target(lbs),Kp,Ki,Kd");
+        Serial.print("STATUS,STEP_TEST_PWM="); Serial.println(stepOpenLoopPWM);
+      } else {
+        Serial.println("ERROR,PWM must be 1-255.");
+      }
+    }
+  }
+}
+
+// ================= PID COMPUTE =================
+double computePID(double input) {
+  error     = targetForce - input;
+  cumError  = constrain(cumError + error, -150, 150);  // Anti-windup
+  rateError = error - lastError;
+
+  double out = (Kp * error) + (Ki * cumError) + (Kd * rateError);
+  lastError = error;
+
+  return constrain(out, -255, 255);
+}
+
+// ================= MOTOR CONTROL =================
+void driveActuator(double pwmVal) {
+  int speed = abs((int)pwmVal);
+  if (speed < 30) speed = 0;  // Deadband
+
+  if (pwmVal > 0) {
+    digitalWrite(DIR_PIN, LOW);
+    analogWrite(PWM_PIN, speed);
+  } else {
+    digitalWrite(DIR_PIN, HIGH);
+    analogWrite(PWM_PIN, speed);
+  }
+}
+
+void stopMotor() {
+  analogWrite(PWM_PIN, 0);
+}
+
+// ================= UTILITIES =================
+void emergencyStop(String reason) {
+  systemState = 0;
+  stopMotor();
+  Serial.print("ERROR,EMERGENCY_STOP: ");
+  Serial.println(reason);
+}
+
+void calibrateTare() {
+  Serial.println("STATUS,TARING...");
+  float tareSum = 0;
+  for (int i = 0; i < 100; i++) {
+    tareSum += analogRead(loadCellPin);
+    delay(5);
+  }
+  float tareAvg = tareSum / 100.0;
+  tareVoltageOffset = (tareAvg / ADCmax) * Vref;
+  Serial.print("STATUS,TARE_DONE Offset=");
+  Serial.print(tareVoltageOffset, 4);
+  Serial.println("V");
+}
+
+void printParams() {
+  Serial.println("--- Current Parameters ---");
+  Serial.print("  Kp     = "); Serial.println(Kp, 4);
+  Serial.print("  Ki     = "); Serial.println(Ki, 4);
+  Serial.print("  Kd     = "); Serial.println(Kd, 4);
+  Serial.print("  Target = "); Serial.print(targetForce, 2); Serial.println(" lbs");
+  Serial.print("  Limit   = "); Serial.print(maxForceLimit, 2); Serial.println(" lbs");
+  Serial.print("  Retract = "); Serial.print(RETRACT_TIME); Serial.println(" ms");
+  Serial.print("  State   = "); Serial.println(systemState);
+}
+
+void printHelp() {
+  Serial.println("--- COMMANDS ---");
+  Serial.println("  go           → Start PID trial");
+  Serial.println("  s            → Stop & retract");
+  Serial.println("  tare         → Re-zero sensor");
+  Serial.println("  params       → Show current settings");
+  Serial.println("  kp:<val>     → Set Kp  (e.g. kp:12.5)");
+  Serial.println("  ki:<val>     → Set Ki  (e.g. ki:0.1)");
+  Serial.println("  kd:<val>     → Set Kd  (e.g. kd:0.05)");
+  Serial.println("  target:<lbs> → Set setpoint (e.g. target:60)");
+  Serial.println("  limit:<lbs>  → Set safety limit");
+  Serial.println("  retract:<ms> → Set retract duration (e.g. retract:10000)");
+  Serial.println("  step:<pwm>   → Open-loop step test (e.g. step:80)");
+  Serial.println("  help         → Show this list");
+}
