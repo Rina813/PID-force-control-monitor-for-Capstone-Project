@@ -1,3 +1,4 @@
+// Code for Arduino IDE application in .ino format
 // ================= CALIBRATION PARAMETERS ====================
 float Vref = 5.019;
 const float ADCmax = 1023.0;
